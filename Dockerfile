@@ -13,7 +13,7 @@ WORKDIR /app
 
 # Install necessary libraries if any (e.g., openssl if needed, though not for basic OSM parsing)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates \
+    ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /usr/src/app/target/release/overpass-minimal /app/overpass-minimal

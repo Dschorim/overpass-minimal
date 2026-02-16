@@ -1,14 +1,13 @@
 use crate::config::Config;
 use crate::model::{Element, StringInterner, CacheData};
 use anyhow::{Result, Context};
-use osmpbf::{ElementReader, Element as OsmElement};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufReader, BufWriter};
 use std::path::Path;
 use std::hash::{Hash, Hasher};
 use std::collections::hash_map::DefaultHasher;
-use tracing::{info, debug};
+use tracing::info;
 use roaring::RoaringBitmap;
 
 pub fn load_or_preprocess(config: &Config, pbf_path: &Path) -> Result<(Vec<Element>, StringInterner)> {
@@ -55,142 +54,173 @@ fn calculate_source_hash(config: &Config, pbf_path: &Path) -> Result<u64> {
 }
 
 fn preprocess(config: &Config, pbf_path: &Path, source_hash: u64, cache_file: &Path) -> Result<(Vec<Element>, StringInterner)> {
+    use osmpbf::{ElementReader, Element as OsmElement};
     info!("Starting Optimized PBF preprocessing: {:?}", pbf_path);
-    let primary_keys: HashSet<_> = config.filters.primary_keys.iter().cloned().collect();
-
     // Pass 1: Identify "Required" Nodes
     info!("Pass 1: Identifying required node IDs...");
-    let mut required_nodes = RoaringBitmap::new();
-    let mut node_count = 0;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    
+    let node_count = AtomicUsize::new(0);
+    let primary_keys_set: HashSet<&str> = config.filters.primary_keys.iter().map(|s| s.as_str()).collect();
+
     let reader = ElementReader::from_path(pbf_path)?;
-    reader.for_each(|element| {
-        match element {
-            OsmElement::Way(way) => {
-                let tags: HashMap<_, _> = way.tags().collect();
-                if has_primary_key(&tags, &primary_keys) {
-                    for node_id in way.refs() {
-                        required_nodes.insert(node_id as u32);
+    let required_nodes: RoaringBitmap = reader.par_map_reduce(
+        |element| {
+            let mut local_required = RoaringBitmap::new();
+            let mut local_count = 0;
+            
+            match element {
+                OsmElement::Way(way) => {
+                    let tags: HashMap<_, _> = way.tags().collect();
+                    if local_has_primary_key(&tags, &primary_keys_set) {
+                        for node_id in way.refs() {
+                            local_required.insert(node_id as u32);
+                        }
                     }
                 }
+                OsmElement::Node(node) => {
+                    local_count += 1;
+                    let tags: HashMap<_, _> = node.tags().collect();
+                    if local_has_primary_key(&tags, &primary_keys_set) {
+                        local_required.insert(node.id() as u32);
+                    }
+                }
+                OsmElement::DenseNode(node) => {
+                    local_count += 1;
+                    let tags: HashMap<_, _> = node.tags().collect();
+                    if local_has_primary_key(&tags, &primary_keys_set) {
+                        local_required.insert(node.id() as u32);
+                    }
+                }
+                _ => {}
             }
-            OsmElement::Node(node) => {
-                node_count += 1;
-                let tags: HashMap<_, _> = node.tags().collect();
-                if has_primary_key(&tags, &primary_keys) {
-                    required_nodes.insert(node.id() as u32);
+            
+            if local_count > 0 {
+                let total = node_count.fetch_add(local_count, Ordering::Relaxed);
+                if (total + local_count) / 50_000_000 > total / 50_000_000 {
+                    info!("  Scanned {}M nodes for requirements...", (total + local_count) / 1_000_000);
                 }
             }
-            OsmElement::DenseNode(node) => {
-                node_count += 1;
-                let tags: HashMap<_, _> = node.tags().collect();
-                if has_primary_key(&tags, &primary_keys) {
-                    required_nodes.insert(node.id() as u32);
-                }
-            }
-            _ => {}
-        }
-        if node_count > 0 && node_count % 50_000_000 == 0 {
-            info!("  Scanned {}M nodes for requirements...", node_count / 1_000_000);
-            node_count += 1; // prevent multiple logs for same count if DensNode chunk? (actually for_each is per element)
-        }
-    })?;
+            
+            local_required
+        },
+        || RoaringBitmap::new(),
+        |mut a, b| {
+            a |= b;
+            a
+        },
+    ).map_err(|e| anyhow::anyhow!("PBF Error: {:?}", e))?;
+
     info!("Identified {} unique nodes required for filtered data.", required_nodes.len());
 
     // Pass 2: Collect Coordinates for Required Nodes only
     info!("Pass 2: Collecting coordinates for {} required nodes...", required_nodes.len());
-    let mut node_coords = HashMap::with_capacity(required_nodes.len() as usize);
-    let mut node_count_pass2 = 0;
-    let reader = ElementReader::from_path(pbf_path)?;
-    reader.for_each(|element| {
-        match element {
-            OsmElement::Node(node) => {
-                node_count_pass2 += 1;
-                let id = node.id() as u32;
-                if required_nodes.contains(id) {
-                    node_coords.insert(id, (node.lat() as f32, node.lon() as f32));
+    let node_coords = dashmap::DashMap::with_capacity(required_nodes.len() as usize);
+    let node_count_pass2 = AtomicUsize::new(0);
+    
+    let reader_pass2 = ElementReader::from_path(pbf_path)?;
+    reader_pass2.par_map_reduce(
+        |element| {
+            let mut local_count = 0;
+            match element {
+                OsmElement::Node(node) => {
+                    local_count += 1;
+                    let id = node.id() as u32;
+                    if required_nodes.contains(id) {
+                        node_coords.insert(id, (node.lat() as f32, node.lon() as f32));
+                    }
+                }
+                OsmElement::DenseNode(node) => {
+                    local_count += 1;
+                    let id = node.id() as u32;
+                    if required_nodes.contains(id) {
+                        node_coords.insert(id, (node.lat() as f32, node.lon() as f32));
+                    }
+                }
+                _ => {}
+            }
+            
+            if local_count > 0 {
+                let total = node_count_pass2.fetch_add(local_count, Ordering::Relaxed);
+                if (total + local_count) / 50_000_000 > total / 50_000_000 {
+                    info!("  Loading coords: {}M nodes inspected...", (total + local_count) / 1_000_000);
                 }
             }
-            OsmElement::DenseNode(node) => {
-                node_count_pass2 += 1;
-                let id = node.id() as u32;
-                if required_nodes.contains(id) {
-                    node_coords.insert(id, (node.lat() as f32, node.lon() as f32));
-                }
-            }
-            _ => {}
-        }
-        if node_count_pass2 > 0 && node_count_pass2 % 50_000_000 == 0 {
-            info!("  Loading coords: {}M nodes inspected...", node_count_pass2 / 1_000_000);
-            node_count_pass2 += 1;
-        }
-    })?;
+        },
+        || (),
+        |_, _| (),
+    ).map_err(|e| anyhow::anyhow!("PBF Error: {:?}", e))?;
+
     info!("Coordinate collection complete. Loaded {} coordinates.", node_coords.len());
 
     // Pass 3: Extract and Filter
     info!("Pass 3: Final extraction and tag interning...");
-    let mut interner = StringInterner::new();
-    let mut elements = Vec::new();
-    let mut matched_count = 0;
+    let interner = StringInterner::new();
+    let primary_keys_set: HashSet<&str> = config.filters.primary_keys.iter().map(|s| s.as_str()).collect();
     
-    let reader = ElementReader::from_path(pbf_path)?;
-    reader.for_each(|element| {
-        match element {
-            OsmElement::Node(node) => {
-                let tags: HashMap<_, _> = node.tags().collect();
-                if has_primary_key(&tags, &primary_keys) {
-                    let mut extracted_tags = Vec::new();
-                    extract_tags(config, &tags, &mut interner, &mut extracted_tags);
-                    elements.push(Element {
-                        id: node.id() as u64,
-                        coordinate: [node.lat(), node.lon()],
-                        tags: extracted_tags,
-                    });
-                    matched_count += 1;
-                }
-            }
-            OsmElement::DenseNode(node) => {
-                let tags: HashMap<_, _> = node.tags().collect();
-                if has_primary_key(&tags, &primary_keys) {
-                    let mut extracted_tags = Vec::new();
-                    extract_tags(config, &tags, &mut interner, &mut extracted_tags);
-                    elements.push(Element {
-                        id: node.id() as u64,
-                        coordinate: [node.lat(), node.lon()],
-                        tags: extracted_tags,
-                    });
-                    matched_count += 1;
-                }
-            }
-            OsmElement::Way(way) => {
-                let tags: HashMap<_, _> = way.tags().collect();
-                if has_primary_key(&tags, &primary_keys) {
-                    let mut lats = 0.0;
-                    let mut lons = 0.0;
-                    let mut count = 0;
-                    for node_id in way.refs() {
-                        if let Some(&(lat, lon)) = node_coords.get(&(node_id as u32)) {
-                            lats += lat as f64;
-                            lons += lon as f64;
-                            count += 1;
-                        }
-                    }
-                    
-                    if count > 0 {
+    let reader_pass3 = ElementReader::from_path(pbf_path)?;
+    let elements = reader_pass3.par_map_reduce(
+        |element| {
+            let mut local_elements = Vec::new();
+
+            match element {
+                OsmElement::Node(node) => {
+                    let tags: HashMap<_, _> = node.tags().collect();
+                    if local_has_primary_key(&tags, &primary_keys_set) {
                         let mut extracted_tags = Vec::new();
-                        extract_tags(config, &tags, &mut interner, &mut extracted_tags);
-                        elements.push(Element {
-                            id: way.id() as u64,
-                            coordinate: [lats / count as f64, lons / count as f64],
+                        extract_tags(config, &tags, &interner, &mut extracted_tags);
+                        local_elements.push(Element {
+                            id: node.id() as u64,
+                            coordinates: [[node.lat(), node.lon()], [node.lat(), node.lon()]],
                             tags: extracted_tags,
                         });
-                        matched_count += 1;
                     }
                 }
+                OsmElement::DenseNode(node) => {
+                    let tags: HashMap<_, _> = node.tags().collect();
+                    if local_has_primary_key(&tags, &primary_keys_set) {
+                        let mut extracted_tags = Vec::new();
+                        extract_tags(config, &tags, &interner, &mut extracted_tags);
+                        local_elements.push(Element {
+                            id: node.id() as u64,
+                            coordinates: [[node.lat(), node.lon()], [node.lat(), node.lon()]],
+                            tags: extracted_tags,
+                        });
+                    }
+                }
+                OsmElement::Way(way) => {
+                    let tags: HashMap<_, _> = way.tags().collect();
+                    if local_has_primary_key(&tags, &primary_keys_set) {
+                        let way_nodes: Vec<_> = way.refs().collect();
+                        for i in 0..way_nodes.len().saturating_sub(1) {
+                            if let (Some(c1), Some(c2)) = 
+                                (node_coords.get(&(way_nodes[i] as u32)), node_coords.get(&(way_nodes[i+1] as u32))) 
+                            {
+                                let (lat1, lon1) = *c1;
+                                let (lat2, lon2) = *c2;
+                                let mut extracted_tags = Vec::new();
+                                extract_tags(config, &tags, &interner, &mut extracted_tags);
+                                local_elements.push(Element {
+                                    id: way.id() as u64,
+                                    coordinates: [[lat1 as f64, lon1 as f64], [lat2 as f64, lon2 as f64]],
+                                    tags: extracted_tags,
+                                });
+                            }
+                        }
+                    }
+                }
+                _ => {}
             }
-            _ => {}
-        }
-    })?;
-    info!("Extraction complete. Matched {} total elements.", matched_count);
+            local_elements
+        },
+        || Vec::new(),
+        |mut a: Vec<Element>, mut b| {
+            a.append(&mut b);
+            a
+        },
+    ).map_err(|e| anyhow::anyhow!("PBF Error: {:?}", e))?;
+
+    info!("Extraction complete. Matched {} total elements.", elements.len());
 
     // Save to cache
     info!("Saving optimized cache to disk...");
@@ -207,7 +237,16 @@ fn preprocess(config: &Config, pbf_path: &Path, source_hash: u64, cache_file: &P
     Ok((elements, interner))
 }
 
-fn extract_tags(config: &Config, tags: &HashMap<&str, &str>, interner: &mut StringInterner, out: &mut Vec<(u32, u32)>) {
+fn local_has_primary_key(tags: &HashMap<&str, &str>, primary_keys: &HashSet<&str>) -> bool {
+    for k in primary_keys {
+        if tags.contains_key(k) {
+            return true;
+        }
+    }
+    false
+}
+
+fn extract_tags(config: &Config, tags: &HashMap<&str, &str>, interner: &StringInterner, out: &mut Vec<(u32, u32)>) {
     for key in &config.filters.primary_keys {
         if let Some(val) = tags.get(key.as_str()) {
             let kid = interner.get_or_intern(key);
@@ -224,11 +263,3 @@ fn extract_tags(config: &Config, tags: &HashMap<&str, &str>, interner: &mut Stri
     }
 }
 
-fn has_primary_key(tags: &HashMap<&str, &str>, primary_keys: &HashSet<String>) -> bool {
-    for k in primary_keys {
-        if tags.contains_key(k.as_str()) {
-            return true;
-        }
-    }
-    false
-}

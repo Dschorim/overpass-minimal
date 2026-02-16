@@ -6,6 +6,7 @@ mod api;
 use clap::Parser;
 use std::path::PathBuf;
 use anyhow::{Result, Context};
+use tracing::info;
 use tracing_subscriber;
 
 #[derive(Parser, Debug)]
@@ -26,7 +27,20 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let start_time = std::time::Instant::now();
+    
     tracing_subscriber::fmt::init();
+    
+    let num_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(16);
+    
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(num_threads)
+        .build_global()
+        .ok();
+
+    info!("Application starting (using {} threads)", num_threads);
 
     let args = Args::parse();
     
@@ -46,7 +60,7 @@ async fn main() -> Result<()> {
     println!("Loaded {} elements.", elements.len());
 
     // Start the API server
-    api::start_server(config, elements, interner).await?;
+    api::start_server(config, elements, interner, start_time).await?;
 
     Ok(())
 }

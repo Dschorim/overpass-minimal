@@ -20,3 +20,6 @@ byteorder = "1.5"
 geo = "0.28"
 geo-types = "0.7"
 roaring = "0.10"
+rayon = "1.10"
+dashmap = "6.0"
+parking_lot = { version = "0.12", features = ["serde"] }

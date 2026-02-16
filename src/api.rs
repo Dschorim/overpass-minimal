@@ -5,10 +5,12 @@ use axum::{
 };
 use crate::config::Config;
 use crate::model::{Element, StringInterner};
-use rstar::{RTree, AABB};
+use rstar::{RTree, AABB, primitives::Line, PointDistance};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::net::SocketAddr;
+use std::collections::HashMap;
+use tracing::info;
 
 #[derive(Clone)]
 struct AppState {
@@ -16,25 +18,23 @@ struct AppState {
     interner: Arc<StringInterner>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct SpatialElement {
     id: u64,
-    coordinate: [f64; 2],
+    segment: Line<[f64; 2]>,
     tags: Vec<(u32, u32)>,
 }
 
 impl rstar::RTreeObject for SpatialElement {
     type Envelope = AABB<[f64; 2]>;
     fn envelope(&self) -> Self::Envelope {
-        AABB::from_point(self.coordinate)
+        self.segment.envelope()
     }
 }
 
 impl rstar::PointDistance for SpatialElement {
     fn distance_2(&self, point: &[f64; 2]) -> f64 {
-        let dx = self.coordinate[0] - point[0];
-        let dy = self.coordinate[1] - point[1];
-        dx * dx + dy * dy
+        self.segment.distance_2(point)
     }
 }
 
@@ -42,7 +42,7 @@ impl rstar::PointDistance for SpatialElement {
 pub struct QueryParams {
     lat: f64,
     lon: f64,
-    radius: f64, // in "degree-ish" units for simplicity in this minimal version, or convert to meters
+    radius: f64, 
 }
 
 #[derive(Serialize)]
@@ -53,18 +53,25 @@ pub struct QueryResponse {
 #[derive(Serialize)]
 pub struct ResultElement {
     id: u64,
-    lat: f64,
-    lon: f64,
+    lat1: f64,
+    lon1: f64,
+    lat2: f64,
+    lon2: f64,
     tags: HashMap<String, String>,
 }
 
-use std::collections::HashMap;
-
-pub async fn start_server(config: Config, elements: Vec<Element>, interner: StringInterner) -> anyhow::Result<()> {
-    let spatial_elements: Vec<SpatialElement> = elements.into_iter().map(|e| SpatialElement {
-        id: e.id,
-        coordinate: e.coordinate,
-        tags: e.tags,
+pub async fn start_server(
+    config: Config, 
+    elements: Vec<Element>, 
+    interner: StringInterner,
+    start_time: std::time::Instant
+) -> anyhow::Result<()> {
+    let spatial_elements: Vec<SpatialElement> = elements.into_iter().map(|e| {
+        SpatialElement {
+            id: e.id,
+            segment: Line::new(e.coordinates[0], e.coordinates[1]),
+            tags: e.tags,
+        }
     }).collect();
 
     let rtree = RTree::bulk_load(spatial_elements);
@@ -81,8 +88,13 @@ pub async fn start_server(config: Config, elements: Vec<Element>, interner: Stri
     let addr_str = format!("{}:{}", config.server.host, config.server.port);
     let addr: SocketAddr = addr_str.parse()?;
     
-    println!("Server listening on {}", addr);
     let listener = tokio::net::TcpListener::bind(addr).await?;
+    
+    let elapsed = start_time.elapsed();
+    
+    info!("Server listening on {}", addr);
+    info!("Total startup time: {:.2?}", elapsed);
+
     axum::serve(listener, app).await?;
 
     Ok(())
@@ -92,9 +104,7 @@ async fn handle_query(
     State(state): State<AppState>,
     Query(params): Query<QueryParams>,
 ) -> Json<QueryResponse> {
-    // radius in degree-ish: roughly 111km per degree.
-    // simpler: search within a bounding box first
-    let radius_deg = params.radius / 111000.0; 
+    let radius_deg = params.radius / 111320.0; 
     
     let envelope = AABB::from_corners(
         [params.lat - radius_deg, params.lon - radius_deg],
@@ -104,13 +114,13 @@ async fn handle_query(
     let results = state.rtree.locate_in_envelope(&envelope);
     
     let mut response_elements = Vec::new();
+    let query_point = [params.lat, params.lon];
+
     for se in results {
-        // filter by actual distance for circular radius
-        let dx = se.coordinate[0] - params.lat;
-        let dy = se.coordinate[1] - params.lon;
-        let dist_deg = (dx*dx + dy*dy).sqrt();
+        // Line::distance_2 requires PointDistance trait in scope
+        let dist_deg_sq = se.segment.distance_2(&query_point);
         
-        if dist_deg <= radius_deg {
+        if dist_deg_sq <= radius_deg * radius_deg {
             let mut tags = HashMap::new();
             for (kid, vid) in &se.tags {
                 if let (Some(k), Some(v)) = (state.interner.lookup(*kid), state.interner.lookup(*vid)) {
@@ -118,10 +128,15 @@ async fn handle_query(
                 }
             }
             
+            let p1 = se.segment.from;
+            let p2 = se.segment.to;
+
             response_elements.push(ResultElement {
                 id: se.id,
-                lat: se.coordinate[0],
-                lon: se.coordinate[1],
+                lat1: p1[0],
+                lon1: p1[1],
+                lat2: p2[0],
+                lon2: p2[1],
                 tags,
             });
         }
