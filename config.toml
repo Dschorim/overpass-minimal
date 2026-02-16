@@ -1,0 +1,15 @@
+[filters]
+# The primary keys to filter elements by (e.g., only elements with these keys will be processed)
+primary_keys = ["highway"]
+
+# The subkeys (attributes) to extract and store in the optimized format
+attribute_keys = ["surface", "smoothness"]
+
+[storage]
+# Directory where preprocessed data will be stored
+cache_dir = "/cache"
+
+[server]
+# API listen address
+host = "0.0.0.0"
+port = 3000
