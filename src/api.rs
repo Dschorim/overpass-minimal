@@ -15,25 +15,26 @@ use tracing::info;
 #[derive(Clone)]
 struct AppState {
     rtree: Arc<RTree<SpatialElement>>,
+    tag_sets: Arc<Vec<Vec<(u32, u32)>>>,
     interner: Arc<StringInterner>,
 }
 
 #[derive(Clone)]
 struct SpatialElement {
     id: u64,
-    segment: Line<[f64; 2]>,
-    tags: Vec<(u32, u32)>,
+    segment: Line<[f32; 2]>,
+    tag_set_id: u32,
 }
 
 impl rstar::RTreeObject for SpatialElement {
-    type Envelope = AABB<[f64; 2]>;
+    type Envelope = AABB<[f32; 2]>;
     fn envelope(&self) -> Self::Envelope {
         self.segment.envelope()
     }
 }
 
 impl rstar::PointDistance for SpatialElement {
-    fn distance_2(&self, point: &[f64; 2]) -> f64 {
+    fn distance_2(&self, point: &[f32; 2]) -> f32 {
         self.segment.distance_2(point)
     }
 }
@@ -63,6 +64,7 @@ pub struct ResultElement {
 pub async fn start_server(
     config: Config, 
     elements: Vec<Element>, 
+    tag_sets: Vec<Vec<(u32, u32)>>,
     interner: StringInterner,
     start_time: std::time::Instant
 ) -> anyhow::Result<()> {
@@ -70,7 +72,7 @@ pub async fn start_server(
         SpatialElement {
             id: e.id,
             segment: Line::new(e.coordinates[0], e.coordinates[1]),
-            tags: e.tags,
+            tag_set_id: e.tag_set_id,
         }
     }).collect();
 
@@ -78,6 +80,7 @@ pub async fn start_server(
     
     let state = AppState {
         rtree: Arc::new(rtree),
+        tag_sets: Arc::new(tag_sets),
         interner: Arc::new(interner),
     };
 
@@ -105,26 +108,28 @@ async fn handle_query(
     Query(params): Query<QueryParams>,
 ) -> Json<QueryResponse> {
     let radius_deg = params.radius / 111320.0; 
+    let radius_deg_f32 = radius_deg as f32;
     
     let envelope = AABB::from_corners(
-        [params.lat - radius_deg, params.lon - radius_deg],
-        [params.lat + radius_deg, params.lon + radius_deg],
+        [(params.lat - radius_deg) as f32, (params.lon - radius_deg) as f32],
+        [(params.lat + radius_deg) as f32, (params.lon + radius_deg) as f32],
     );
 
     let results = state.rtree.locate_in_envelope(&envelope);
     
     let mut response_elements = Vec::new();
-    let query_point = [params.lat, params.lon];
+    let query_point = [params.lat as f32, params.lon as f32];
 
     for se in results {
-        // Line::distance_2 requires PointDistance trait in scope
         let dist_deg_sq = se.segment.distance_2(&query_point);
         
-        if dist_deg_sq <= radius_deg * radius_deg {
+        if dist_deg_sq <= radius_deg_f32 * radius_deg_f32 {
             let mut tags = HashMap::new();
-            for (kid, vid) in &se.tags {
-                if let (Some(k), Some(v)) = (state.interner.lookup(*kid), state.interner.lookup(*vid)) {
-                    tags.insert(k.to_string(), v.to_string());
+            if let Some(tag_set) = state.tag_sets.get(se.tag_set_id as usize) {
+                for (kid, vid) in tag_set {
+                    if let (Some(k), Some(v)) = (state.interner.lookup(*kid), state.interner.lookup(*vid)) {
+                        tags.insert(k, v);
+                    }
                 }
             }
             
@@ -133,10 +138,10 @@ async fn handle_query(
 
             response_elements.push(ResultElement {
                 id: se.id,
-                lat1: p1[0],
-                lon1: p1[1],
-                lat2: p2[0],
-                lon2: p2[1],
+                lat1: p1[0] as f64,
+                lon1: p1[1] as f64,
+                lat2: p2[0] as f64,
+                lon2: p2[1] as f64,
                 tags,
             });
         }

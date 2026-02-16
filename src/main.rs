@@ -56,11 +56,11 @@ async fn main() -> Result<()> {
     }
 
     println!("Loading data...");
-    let (elements, interner) = preprocessor::load_or_preprocess(&config, &args.input)?;
+    let (elements, tag_sets, interner) = preprocessor::load_or_preprocess(&config, &args.input)?;
     println!("Loaded {} elements.", elements.len());
 
     // Start the API server
-    api::start_server(config, elements, interner, start_time).await?;
+    api::start_server(config, elements, tag_sets, interner, start_time).await?;
 
     Ok(())
 }

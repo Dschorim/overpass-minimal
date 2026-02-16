@@ -5,10 +5,10 @@ use std::collections::HashMap;
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Element {
     pub id: u64,
-    /// [[lat1, lon1], [lat2, lon2]]
-    pub coordinates: [[f64; 2]; 2],
-    /// List of (KeyID, ValueID) pairs
-    pub tags: Vec<(u32, u32)>,
+    /// [[lat1, lon1], [lat2, lon2]] stored as f32 for memory efficiency (~1cm precision)
+    pub coordinates: [[f32; 2]; 2],
+    /// Index into the tag_sets list in CacheData
+    pub tag_set_id: u32,
 }
 
 use parking_lot::RwLock;
@@ -65,6 +65,7 @@ impl StringInterner {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CacheData {
     pub elements: Vec<Element>,
+    pub tag_sets: Vec<Vec<(u32, u32)>>,
     pub interner: StringInterner,
     /// Store a hash of the config AND input file metadata to know when to re-preprocess
     pub source_hash: u64,

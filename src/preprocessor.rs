@@ -9,8 +9,10 @@ use std::hash::{Hash, Hasher};
 use std::collections::hash_map::DefaultHasher;
 use tracing::info;
 use roaring::RoaringBitmap;
+use dashmap::DashMap;
+use parking_lot::RwLock;
 
-pub fn load_or_preprocess(config: &Config, pbf_path: &Path) -> Result<(Vec<Element>, StringInterner)> {
+pub fn load_or_preprocess(config: &Config, pbf_path: &Path) -> Result<(Vec<Element>, Vec<Vec<(u32, u32)>>, StringInterner)> {
     let source_hash = calculate_source_hash(config, pbf_path)?;
     let cache_file = config.storage.cache_dir.join("data.bin");
 
@@ -22,7 +24,7 @@ pub fn load_or_preprocess(config: &Config, pbf_path: &Path) -> Result<(Vec<Eleme
         if let Ok(cache_data) = cache_data_res {
             if cache_data.source_hash == source_hash {
                 info!("Loading data from cache: {:?}", cache_file);
-                return Ok((cache_data.elements, cache_data.interner));
+                return Ok((cache_data.elements, cache_data.tag_sets, cache_data.interner));
             }
         }
         info!("Input file or config changed, re-preprocessing...");
@@ -53,7 +55,7 @@ fn calculate_source_hash(config: &Config, pbf_path: &Path) -> Result<u64> {
     Ok(s.finish())
 }
 
-fn preprocess(config: &Config, pbf_path: &Path, source_hash: u64, cache_file: &Path) -> Result<(Vec<Element>, StringInterner)> {
+fn preprocess(config: &Config, pbf_path: &Path, source_hash: u64, cache_file: &Path) -> Result<(Vec<Element>, Vec<Vec<(u32, u32)>>, StringInterner)> {
     use osmpbf::{ElementReader, Element as OsmElement};
     info!("Starting Optimized PBF preprocessing: {:?}", pbf_path);
     // Pass 1: Identify "Required" Nodes
@@ -158,6 +160,10 @@ fn preprocess(config: &Config, pbf_path: &Path, source_hash: u64, cache_file: &P
     let interner = StringInterner::new();
     let primary_keys_set: HashSet<&str> = config.filters.primary_keys.iter().map(|s| s.as_str()).collect();
     
+    // Tag set interning to save massive RAM for way segments
+    let tag_set_interner = DashMap::new();
+    let tag_sets_reverse = RwLock::new(Vec::new());
+
     let reader_pass3 = ElementReader::from_path(pbf_path)?;
     let elements = reader_pass3.par_map_reduce(
         |element| {
@@ -169,10 +175,25 @@ fn preprocess(config: &Config, pbf_path: &Path, source_hash: u64, cache_file: &P
                     if local_has_primary_key(&tags, &primary_keys_set) {
                         let mut extracted_tags = Vec::new();
                         extract_tags(config, &tags, &interner, &mut extracted_tags);
+                        
+                        let tag_set_id = if let Some(id) = tag_set_interner.get(&extracted_tags) {
+                            *id
+                        } else {
+                            let mut reverse = tag_sets_reverse.write();
+                            if let Some(id) = tag_set_interner.get(&extracted_tags) {
+                                *id
+                            } else {
+                                let id = reverse.len() as u32;
+                                tag_set_interner.insert(extracted_tags.clone(), id);
+                                reverse.push(extracted_tags);
+                                id
+                            }
+                        };
+
                         local_elements.push(Element {
                             id: node.id() as u64,
-                            coordinates: [[node.lat(), node.lon()], [node.lat(), node.lon()]],
-                            tags: extracted_tags,
+                            coordinates: [[node.lat() as f32, node.lon() as f32], [node.lat() as f32, node.lon() as f32]],
+                            tag_set_id,
                         });
                     }
                 }
@@ -181,16 +202,48 @@ fn preprocess(config: &Config, pbf_path: &Path, source_hash: u64, cache_file: &P
                     if local_has_primary_key(&tags, &primary_keys_set) {
                         let mut extracted_tags = Vec::new();
                         extract_tags(config, &tags, &interner, &mut extracted_tags);
+                        
+                        let tag_set_id = if let Some(id) = tag_set_interner.get(&extracted_tags) {
+                            *id
+                        } else {
+                            let mut reverse = tag_sets_reverse.write();
+                            if let Some(id) = tag_set_interner.get(&extracted_tags) {
+                                *id
+                            } else {
+                                let id = reverse.len() as u32;
+                                tag_set_interner.insert(extracted_tags.clone(), id);
+                                reverse.push(extracted_tags);
+                                id
+                            }
+                        };
+
                         local_elements.push(Element {
                             id: node.id() as u64,
-                            coordinates: [[node.lat(), node.lon()], [node.lat(), node.lon()]],
-                            tags: extracted_tags,
+                            coordinates: [[node.lat() as f32, node.lon() as f32], [node.lat() as f32, node.lon() as f32]],
+                            tag_set_id,
                         });
                     }
                 }
                 OsmElement::Way(way) => {
                     let tags: HashMap<_, _> = way.tags().collect();
                     if local_has_primary_key(&tags, &primary_keys_set) {
+                        let mut extracted_tags = Vec::new();
+                        extract_tags(config, &tags, &interner, &mut extracted_tags);
+                        
+                        let tag_set_id = if let Some(id) = tag_set_interner.get(&extracted_tags) {
+                            *id
+                        } else {
+                            let mut reverse = tag_sets_reverse.write();
+                            if let Some(id) = tag_set_interner.get(&extracted_tags) {
+                                *id
+                            } else {
+                                let id = reverse.len() as u32;
+                                tag_set_interner.insert(extracted_tags.clone(), id);
+                                reverse.push(extracted_tags);
+                                id
+                            }
+                        };
+
                         let way_nodes: Vec<_> = way.refs().collect();
                         for i in 0..way_nodes.len().saturating_sub(1) {
                             if let (Some(c1), Some(c2)) = 
@@ -198,12 +251,10 @@ fn preprocess(config: &Config, pbf_path: &Path, source_hash: u64, cache_file: &P
                             {
                                 let (lat1, lon1) = *c1;
                                 let (lat2, lon2) = *c2;
-                                let mut extracted_tags = Vec::new();
-                                extract_tags(config, &tags, &interner, &mut extracted_tags);
                                 local_elements.push(Element {
                                     id: way.id() as u64,
-                                    coordinates: [[lat1 as f64, lon1 as f64], [lat2 as f64, lon2 as f64]],
-                                    tags: extracted_tags,
+                                    coordinates: [[lat1, lon1], [lat2, lon2]],
+                                    tag_set_id,
                                 });
                             }
                         }
@@ -221,6 +272,8 @@ fn preprocess(config: &Config, pbf_path: &Path, source_hash: u64, cache_file: &P
     ).map_err(|e| anyhow::anyhow!("PBF Error: {:?}", e))?;
 
     info!("Extraction complete. Matched {} total elements.", elements.len());
+    let final_tag_sets = tag_sets_reverse.into_inner();
+    info!("Total unique tag sets: {}", final_tag_sets.len());
 
     // Save to cache
     info!("Saving optimized cache to disk...");
@@ -228,13 +281,14 @@ fn preprocess(config: &Config, pbf_path: &Path, source_hash: u64, cache_file: &P
     let writer = BufWriter::new(file);
     let cache_data = CacheData {
         elements: elements.clone(),
+        tag_sets: final_tag_sets.clone(),
         interner: interner.clone(),
         source_hash,
     };
     bincode::serialize_into(writer, &cache_data)?;
     info!("Cache saved successfully.");
 
-    Ok((elements, interner))
+    Ok((elements, final_tag_sets, interner))
 }
 
 fn local_has_primary_key(tags: &HashMap<&str, &str>, primary_keys: &HashSet<&str>) -> bool {
