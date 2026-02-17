@@ -58,6 +58,8 @@ pub struct ResultElement {
     lon1: f64,
     lat2: f64,
     lon2: f64,
+    #[serde(rename = "type")]
+    element_type: String,
     tags: HashMap<String, String>,
 }
 
@@ -109,43 +111,44 @@ async fn handle_query(
 ) -> Json<QueryResponse> {
     let radius_deg = params.radius / 111320.0; 
     let radius_deg_f32 = radius_deg as f32;
-    
-    let envelope = AABB::from_corners(
-        [(params.lat - radius_deg) as f32, (params.lon - radius_deg) as f32],
-        [(params.lat + radius_deg) as f32, (params.lon + radius_deg) as f32],
-    );
-
-    let results = state.rtree.locate_in_envelope(&envelope);
-    
-    let mut response_elements = Vec::new();
     let query_point = [params.lat as f32, params.lon as f32];
 
+    // Using locate_within_distance for better accuracy and performance
+    let results = state.rtree.locate_within_distance(query_point, radius_deg_f32 * radius_deg_f32);
+    
+    let mut response_elements = Vec::new();
+
     for se in results {
-        let dist_deg_sq = se.segment.distance_2(&query_point);
-        
-        if dist_deg_sq <= radius_deg_f32 * radius_deg_f32 {
-            let mut tags = HashMap::new();
-            if let Some(tag_set) = state.tag_sets.get(se.tag_set_id as usize) {
-                for (kid, vid) in tag_set {
-                    if let (Some(k), Some(v)) = (state.interner.lookup(*kid), state.interner.lookup(*vid)) {
-                        tags.insert(k, v);
-                    }
+        let mut tags = HashMap::new();
+        if let Some(tag_set) = state.tag_sets.get(se.tag_set_id as usize) {
+            for (kid, vid) in tag_set {
+                if let (Some(k), Some(v)) = (state.interner.lookup(*kid), state.interner.lookup(*vid)) {
+                    tags.insert(k, v);
                 }
             }
-            
-            let p1 = se.segment.from;
-            let p2 = se.segment.to;
-
-            response_elements.push(ResultElement {
-                id: se.id,
-                lat1: p1[0] as f64,
-                lon1: p1[1] as f64,
-                lat2: p2[0] as f64,
-                lon2: p2[1] as f64,
-                tags,
-            });
         }
+        
+        let p1 = se.segment.from;
+        let p2 = se.segment.to;
+        let element_type = if p1 == p2 { "node" } else { "way" }.to_string();
+
+        // RTree returns &SpatialElement, so we calculate distance to the original query point
+        let dist_deg_sq = se.segment.distance_2(&query_point);
+
+        response_elements.push((dist_deg_sq, ResultElement {
+            id: se.id,
+            lat1: p1[0] as f64,
+            lon1: p1[1] as f64,
+            lat2: p2[0] as f64,
+            lon2: p2[1] as f64,
+            element_type,
+            tags,
+        }));
     }
 
-    Json(QueryResponse { elements: response_elements })
+    // Sort by distance (ASC)
+    response_elements.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    let final_elements: Vec<ResultElement> = response_elements.into_iter().map(|(_, e)| e).collect();
+
+    Json(QueryResponse { elements: final_elements })
 }

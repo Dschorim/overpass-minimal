@@ -8,9 +8,11 @@ use std::path::Path;
 use std::hash::{Hash, Hasher};
 use std::collections::hash_map::DefaultHasher;
 use tracing::info;
-use roaring::RoaringBitmap;
+use roaring::RoaringTreemap;
 use dashmap::DashMap;
 use parking_lot::RwLock;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub fn load_or_preprocess(config: &Config, pbf_path: &Path) -> Result<(Vec<Element>, Vec<Vec<(u32, u32)>>, StringInterner)> {
     let source_hash = calculate_source_hash(config, pbf_path)?;
@@ -60,15 +62,14 @@ fn preprocess(config: &Config, pbf_path: &Path, source_hash: u64, cache_file: &P
     info!("Starting Optimized PBF preprocessing: {:?}", pbf_path);
     // Pass 1: Identify "Required" Nodes
     info!("Pass 1: Identifying required node IDs...");
-    use std::sync::atomic::{AtomicUsize, Ordering};
     
     let node_count = AtomicUsize::new(0);
     let primary_keys_set: HashSet<&str> = config.filters.primary_keys.iter().map(|s| s.as_str()).collect();
 
     let reader = ElementReader::from_path(pbf_path)?;
-    let required_nodes: RoaringBitmap = reader.par_map_reduce(
+    let required_nodes: RoaringTreemap = reader.par_map_reduce(
         |element| {
-            let mut local_required = RoaringBitmap::new();
+            let mut local_required = RoaringTreemap::new();
             let mut local_count = 0;
             
             match element {
@@ -76,7 +77,7 @@ fn preprocess(config: &Config, pbf_path: &Path, source_hash: u64, cache_file: &P
                     let tags: HashMap<_, _> = way.tags().collect();
                     if local_has_primary_key(&tags, &primary_keys_set) {
                         for node_id in way.refs() {
-                            local_required.insert(node_id as u32);
+                            local_required.insert(node_id as u64);
                         }
                     }
                 }
@@ -84,14 +85,14 @@ fn preprocess(config: &Config, pbf_path: &Path, source_hash: u64, cache_file: &P
                     local_count += 1;
                     let tags: HashMap<_, _> = node.tags().collect();
                     if local_has_primary_key(&tags, &primary_keys_set) {
-                        local_required.insert(node.id() as u32);
+                        local_required.insert(node.id() as u64);
                     }
                 }
                 OsmElement::DenseNode(node) => {
                     local_count += 1;
                     let tags: HashMap<_, _> = node.tags().collect();
                     if local_has_primary_key(&tags, &primary_keys_set) {
-                        local_required.insert(node.id() as u32);
+                        local_required.insert(node.id() as u64);
                     }
                 }
                 _ => {}
@@ -106,7 +107,7 @@ fn preprocess(config: &Config, pbf_path: &Path, source_hash: u64, cache_file: &P
             
             local_required
         },
-        || RoaringBitmap::new(),
+        || RoaringTreemap::new(),
         |mut a, b| {
             a |= b;
             a
@@ -117,8 +118,9 @@ fn preprocess(config: &Config, pbf_path: &Path, source_hash: u64, cache_file: &P
 
     // Pass 2: Collect Coordinates for Required Nodes only
     info!("Pass 2: Collecting coordinates for {} required nodes...", required_nodes.len());
-    let node_coords = dashmap::DashMap::with_capacity(required_nodes.len() as usize);
+    let node_coords = Arc::new(dashmap::DashMap::with_capacity(required_nodes.len() as usize));
     let node_count_pass2 = AtomicUsize::new(0);
+    let coords_stored = AtomicUsize::new(0);
     
     let reader_pass2 = ElementReader::from_path(pbf_path)?;
     reader_pass2.par_map_reduce(
@@ -127,16 +129,18 @@ fn preprocess(config: &Config, pbf_path: &Path, source_hash: u64, cache_file: &P
             match element {
                 OsmElement::Node(node) => {
                     local_count += 1;
-                    let id = node.id() as u32;
+                    let id = node.id() as u64;
                     if required_nodes.contains(id) {
                         node_coords.insert(id, (node.lat() as f32, node.lon() as f32));
+                        coords_stored.fetch_add(1, Ordering::Relaxed);
                     }
                 }
                 OsmElement::DenseNode(node) => {
                     local_count += 1;
-                    let id = node.id() as u32;
+                    let id = node.id() as u64;
                     if required_nodes.contains(id) {
                         node_coords.insert(id, (node.lat() as f32, node.lon() as f32));
+                        coords_stored.fetch_add(1, Ordering::Relaxed);
                     }
                 }
                 _ => {}
@@ -152,12 +156,16 @@ fn preprocess(config: &Config, pbf_path: &Path, source_hash: u64, cache_file: &P
         || (),
         |_, _| (),
     ).map_err(|e| anyhow::anyhow!("PBF Error: {:?}", e))?;
-
-    info!("Coordinate collection complete. Loaded {} coordinates.", node_coords.len());
+    
+    let final_coords_stored = coords_stored.load(Ordering::Relaxed) as u64;
+    info!("Coordinate collection complete. Loaded {} coordinates (expected {}).", final_coords_stored, required_nodes.len());
+    if final_coords_stored < required_nodes.len() {
+        info!("  WARNING: {} required nodes were NOT found in the PBF file.", required_nodes.len() - final_coords_stored);
+    }
 
     // Pass 3: Extract and Filter
     info!("Pass 3: Final extraction and tag interning...");
-    let interner = StringInterner::new();
+    let interner = Arc::new(StringInterner::new());
     let primary_keys_set: HashSet<&str> = config.filters.primary_keys.iter().map(|s| s.as_str()).collect();
     
     // Tag set interning to save massive RAM for way segments
@@ -165,9 +173,12 @@ fn preprocess(config: &Config, pbf_path: &Path, source_hash: u64, cache_file: &P
     let tag_sets_reverse = RwLock::new(Vec::new());
 
     let reader_pass3 = ElementReader::from_path(pbf_path)?;
+    let segments_skipped = AtomicUsize::new(0);
+    
     let elements = reader_pass3.par_map_reduce(
         |element| {
             let mut local_elements = Vec::new();
+            let mut local_skips = 0;
 
             match element {
                 OsmElement::Node(node) => {
@@ -245,9 +256,13 @@ fn preprocess(config: &Config, pbf_path: &Path, source_hash: u64, cache_file: &P
                         };
 
                         let way_nodes: Vec<_> = way.refs().collect();
+                        let mut segments_added = 0;
+                        if way.id() == 276301579 {
+                            info!("Processing Way 276301579: {} nodes found in PBF.", way_nodes.len());
+                        }
                         for i in 0..way_nodes.len().saturating_sub(1) {
                             if let (Some(c1), Some(c2)) = 
-                                (node_coords.get(&(way_nodes[i] as u32)), node_coords.get(&(way_nodes[i+1] as u32))) 
+                                (node_coords.get(&(way_nodes[i] as u64)), node_coords.get(&(way_nodes[i+1] as u64))) 
                             {
                                 let (lat1, lon1) = *c1;
                                 let (lat2, lon2) = *c2;
@@ -256,11 +271,32 @@ fn preprocess(config: &Config, pbf_path: &Path, source_hash: u64, cache_file: &P
                                     coordinates: [[lat1, lon1], [lat2, lon2]],
                                     tag_set_id,
                                 });
+                                segments_added += 1;
+                            } else {
+                                if way.id() == 276301579 {
+                                    // Log exactly which node is missing for this way
+                                    let node_idx = i; // either i or i+1
+                                    let missing_node_id = if node_idx == i { way_nodes[i] } else { way_nodes[i+1] };
+                                    info!("  Way 276301579: Missing coordinate for node ID {} (index {}).", missing_node_id, node_idx);
+                                }
+                                local_skips += 1;
                             }
+                        }
+                        if way.id() == 276301579 {
+                            info!("Way 276301579: Added {} segments, skipped {}.", segments_added, way_nodes.len().saturating_sub(1) - segments_added);
+                        }
+                        if segments_added == 0 && !way_nodes.is_empty() {
+                            // This is a warning sign - we have a tagged way but couldn't find its nodes
+                            // Often happens if the PBF is an extract that doesn't include "uninteresting" nodes
+                            // but those nodes are still needed for way geometry.
+                            // We don't log every one to avoid spam, but we should know if it happens.
                         }
                     }
                 }
                 _ => {}
+            }
+            if local_skips > 0 {
+                segments_skipped.fetch_add(local_skips, Ordering::Relaxed);
             }
             local_elements
         },
@@ -272,6 +308,10 @@ fn preprocess(config: &Config, pbf_path: &Path, source_hash: u64, cache_file: &P
     ).map_err(|e| anyhow::anyhow!("PBF Error: {:?}", e))?;
 
     info!("Extraction complete. Matched {} total elements.", elements.len());
+    let final_skips = segments_skipped.load(Ordering::Relaxed);
+    if final_skips > 0 {
+        info!("  WARNING: {} way segments were skipped due to missing node coordinates.", final_skips);
+    }
     let final_tag_sets = tag_sets_reverse.into_inner();
     info!("Total unique tag sets: {}", final_tag_sets.len());
 
@@ -282,13 +322,14 @@ fn preprocess(config: &Config, pbf_path: &Path, source_hash: u64, cache_file: &P
     let cache_data = CacheData {
         elements: elements.clone(),
         tag_sets: final_tag_sets.clone(),
-        interner: interner.clone(),
+        interner: (*interner).clone(),
         source_hash,
     };
     bincode::serialize_into(writer, &cache_data)?;
     info!("Cache saved successfully.");
-
-    Ok((elements, final_tag_sets, interner))
+    
+    let final_interner = (*interner).clone();
+    Ok((elements, final_tag_sets, final_interner))
 }
 
 fn local_has_primary_key(tags: &HashMap<&str, &str>, primary_keys: &HashSet<&str>) -> bool {
