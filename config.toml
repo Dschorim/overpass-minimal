@@ -3,7 +3,7 @@
 primary_keys = ["highway"]
 
 # The subkeys (attributes) to extract and store in the optimized format
-attribute_keys = ["surface", "smoothness"]
+attribute_keys = ["surface", "smoothness", "tunnel", "layer"]
 
 [storage]
 # Directory where preprocessed data will be stored
