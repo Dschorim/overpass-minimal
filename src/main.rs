@@ -55,9 +55,9 @@ async fn main() -> Result<()> {
             .with_context(|| format!("Failed to create cache directory: {:?}", config.storage.cache_dir))?;
     }
 
-    println!("Loading data...");
+    info!("Loading data...");
     let (elements, tag_sets, interner) = preprocessor::load_or_preprocess(&config, &args.input)?;
-    println!("Loaded {} elements.", elements.len());
+    info!("Loaded {} elements.", elements.len());
 
     // Start the API server
     api::start_server(config, elements, tag_sets, interner, start_time).await?;

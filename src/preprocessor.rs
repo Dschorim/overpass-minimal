@@ -171,6 +171,21 @@ fn preprocess(config: &Config, pbf_path: &Path, source_hash: u64, cache_file: &P
     // Tag set interning to save massive RAM for way segments
     let tag_set_interner = DashMap::new();
     let tag_sets_reverse = RwLock::new(Vec::new());
+    
+    let get_tag_set_id = |interner: &DashMap<Vec<(u32, u32)>, u32>, reverse_lock: &RwLock<Vec<Vec<(u32, u32)>>>, tags: Vec<(u32, u32)>| -> u32 {
+        if let Some(id) = interner.get(&tags) {
+            return *id;
+        }
+        let mut reverse = reverse_lock.write();
+        if let Some(id) = interner.get(&tags) {
+            *id
+        } else {
+            let id = reverse.len() as u32;
+            interner.insert(tags.clone(), id);
+            reverse.push(tags);
+            id
+        }
+    };
 
     let reader_pass3 = ElementReader::from_path(pbf_path)?;
     let segments_skipped = AtomicUsize::new(0);
@@ -257,9 +272,6 @@ fn preprocess(config: &Config, pbf_path: &Path, source_hash: u64, cache_file: &P
 
                         let way_nodes: Vec<_> = way.refs().collect();
                         let mut segments_added = 0;
-                        if way.id() == 276301579 {
-                            info!("Processing Way 276301579: {} nodes found in PBF.", way_nodes.len());
-                        }
                         for i in 0..way_nodes.len().saturating_sub(1) {
                             if let (Some(c1), Some(c2)) = 
                                 (node_coords.get(&(way_nodes[i] as u64)), node_coords.get(&(way_nodes[i+1] as u64))) 
@@ -273,17 +285,8 @@ fn preprocess(config: &Config, pbf_path: &Path, source_hash: u64, cache_file: &P
                                 });
                                 segments_added += 1;
                             } else {
-                                if way.id() == 276301579 {
-                                    // Log exactly which node is missing for this way
-                                    let node_idx = i; // either i or i+1
-                                    let missing_node_id = if node_idx == i { way_nodes[i] } else { way_nodes[i+1] };
-                                    info!("  Way 276301579: Missing coordinate for node ID {} (index {}).", missing_node_id, node_idx);
-                                }
                                 local_skips += 1;
                             }
-                        }
-                        if way.id() == 276301579 {
-                            info!("Way 276301579: Added {} segments, skipped {}.", segments_added, way_nodes.len().saturating_sub(1) - segments_added);
                         }
                         if segments_added == 0 && !way_nodes.is_empty() {
                             // This is a warning sign - we have a tagged way but couldn't find its nodes
