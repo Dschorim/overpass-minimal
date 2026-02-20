@@ -8,8 +8,25 @@ attribute_keys = ["surface", "smoothness", "tunnel", "layer", "name", "address"]
 [storage]
 # Directory where preprocessed data will be stored
 cache_dir = "/cache"
+# zstd compression level for cache (0=fast, higher = better compression)
+zstd_level = 3
+# Note: mmap-backed pool and full-mmap cache support were removed.
+# The runtime always uses the serialized `data.bin.zst` cache and in-memory structures.
 
 [server]
 # API listen address
 host = "0.0.0.0"
 port = 3000
+
+[profiling]
+# Enable CPU sampling profiler (flamegraph written at `profiling.out` when true)
+enabled = false
+out = "preprocess.svg"
+# Sampling frequency (samples/sec)
+frequency = 100
+
+[runtime]
+# If true, drop the internal `HashMap<String,u32>` inside the interner after loading
+# the cache to free duplicated String allocations (recommended for lower RAM usage).
+# Keep `pool` + `offsets`/`lengths` so runtime lookups still work.
+drop_interner_map = true
